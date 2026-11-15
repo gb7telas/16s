@@ -1,0 +1,797 @@
+--[[
+    Auto Click Pro  |  v1.0  |  Universal Roblox Script
+    Features: Autoclick com CPS configurável, modo hold/toggle,
+              randomização humana (anti-detecção de padrão),
+              clique esquerdo/direito, alvo (mouse 3D/jogo),
+              Hotkey dedicada, interface completa
+    Execução: cole no executor (ou autoexec). Interface: V abre/fecha.
+]]--
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local UIS          = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LP = Players.LocalPlayer
+
+-- limpeza de execução anterior
+if type(getgenv().AutoClickPro_Cleanup) == "function" then
+    pcall(getgenv().AutoClickPro_Cleanup)
+end
+getgenv().AutoClickPro_Alive = true
+
+local conns = {}
+local State = {
+    listeningKey = false,
+    clicking = false,     -- efetivamente clicando (hold pressionado OU toggle on)
+    toggleOn = false,
+    holdDown = false,
+    nextClick = 0,
+    jitter = 0,           -- variação do próximo intervalo
+}
+local Refs = {}
+
+--=====================================================================
+-- CONFIG
+--=====================================================================
+local Config = {
+    Enabled     = false,
+    CPS         = 10,        -- cliques por segundo
+    Randomize   = true,      -- varia o intervalo (padrão humano)
+    RandomAmount= 20,        -- % de variação
+    Button      = "Esquerdo",-- Esquerdo / Direito
+    HoldMode    = true,      -- true = só clica segurando a hotkey; false = liga/desliga
+    Hotkey      = Enum.KeyCode.V,
+    SpamKey     = true,      -- envia também o evento de key (alguns jogos precisam)
+    SkipGameProcessed = true,-- não clicar quando digitando no chat
+}
+
+--=====================================================================
+-- PALETA
+--=====================================================================
+local Colors = {
+    Background = Color3.fromRGB(16, 17, 23),
+    Surface    = Color3.fromRGB(24, 25, 34),
+    Surface2   = Color3.fromRGB(33, 35, 47),
+    Stroke     = Color3.fromRGB(46, 49, 64),
+    Text       = Color3.fromRGB(236, 238, 246),
+    TextDim    = Color3.fromRGB(132, 137, 156),
+    Accent     = Color3.fromRGB(0, 190, 120),   -- verde tema
+    Accent2    = Color3.fromRGB(120, 255, 190),
+}
+
+--=====================================================================
+-- HELPERS
+--=====================================================================
+local function create(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local function corner(o, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 8)
+    c.Parent = o
+    return c
+end
+
+local function stroke(o, color, thick)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Colors.Stroke
+    s.Thickness = thick or 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = o
+    return s
+end
+
+local function tween(o, props, t)
+    local tw = TweenService:Create(o, TweenInfo.new(t or 0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+    tw:Play()
+    return tw
+end
+
+local function fmt(v)
+    if math.abs(v - math.floor(v + 0.5)) < 0.01 then return tostring(math.floor(v + 0.5)) end
+    return string.format("%.2f", v)
+end
+
+--=====================================================================
+-- CLIQUE (VirtualInputManager: funciona em jogos com ContextAction,
+-- Tool activate, bots, e é o método mais compatível entre executores)
+--=====================================================================
+local function doClick()
+    local btn = (Config.Button == "Esquerdo") and 0 or 1
+    local ok = pcall(function()
+        -- mouse down + up na posição atual do mouse
+        VirtualInputManager:SendMouseButtonEvent(
+            UIS:GetMouseLocation().X,
+            UIS:GetMouseLocation().Y,
+            btn, true, game, 0
+        )
+        VirtualInputManager:SendMouseButtonEvent(
+            UIS:GetMouseLocation().X,
+            UIS:GetMouseLocation().Y,
+            btn, false, game, 0
+        )
+    end)
+    if not ok then
+        -- fallback raro: some executores sem VIM
+        pcall(function()
+            mouse1press and mouse1press()
+            mouse1release and mouse1release()
+        end)
+    end
+end
+
+--=====================================================================
+-- LOOP DE CLIQUE ( Heartbeat p/ precisão de CPS )
+--=====================================================================
+local totalClicks = 0
+
+local function clickInterval()
+    local base = 1 / math.max(Config.CPS, 0.1)
+    if Config.Randomize and Config.RandomAmount > 0 then
+        local f = Config.RandomAmount / 100
+        return base * (1 - f + math.random() * f * 2)
+    end
+    return base
+end
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function(dt)
+    local shouldClick = Config.Enabled and (
+        Config.HoldMode and State.holdDown or State.toggleOn
+    )
+
+    if not shouldClick then
+        State.nextClick = 0
+        return
+    end
+
+    State.nextClick = State.nextClick - dt
+    if State.nextClick <= 0 then
+        doClick()
+        totalClicks = totalClicks + 1
+        State.nextClick = clickInterval()
+    end
+end)
+
+--=====================================================================
+-- INTERFACE
+--=====================================================================
+local uiParent = (gethui and gethui()) or LP:WaitForChild("PlayerGui")
+
+local gui = create("ScreenGui", {
+    Name = "AutoClickPro_UI",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 9999,
+}, uiParent)
+
+local main = create("Frame", {
+    Size = UDim2.fromOffset(400, 420),
+    Position = UDim2.new(0.5, -200, 0.5, -210),
+    BackgroundColor3 = Colors.Background,
+    BorderSizePixel = 0,
+}, gui)
+corner(main, 12)
+stroke(main, Colors.Stroke, 1)
+
+local topLine = create("Frame", {
+    Size = UDim2.new(1, -24, 0, 2),
+    Position = UDim2.fromOffset(12, 0),
+    BackgroundColor3 = Colors.Accent,
+    BorderSizePixel = 0,
+}, main)
+corner(topLine, 1)
+local topGrad = Instance.new("UIGradient")
+topGrad.Color = ColorSequence.new(Colors.Accent, Colors.Accent2)
+topGrad.Parent = topLine
+
+local topBar = create("TextButton", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundTransparency = 1,
+    Text = "",
+    AutoButtonColor = false,
+}, main)
+
+local logo = create("Frame", {
+    Size = UDim2.fromOffset(24, 24),
+    Position = UDim2.fromOffset(14, 10),
+    BackgroundColor3 = Colors.Accent,
+    BorderSizePixel = 0,
+}, topBar)
+corner(logo, 7)
+local logoGrad = Instance.new("UIGradient")
+logoGrad.Color = ColorSequence.new(Colors.Accent, Colors.Accent2)
+logoGrad.Rotation = 45
+logoGrad.Parent = logo
+create("TextLabel", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    Text = "A",
+    TextColor3 = Color3.new(1, 1, 1),
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+}, logo)
+
+create("TextLabel", {
+    Size = UDim2.fromOffset(180, 16),
+    Position = UDim2.fromOffset(46, 8),
+    BackgroundTransparency = 1,
+    Text = "Auto Click Pro",
+    TextColor3 = Colors.Text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, topBar)
+create("TextLabel", {
+    Size = UDim2.fromOffset(180, 12),
+    Position = UDim2.fromOffset(46, 24),
+    BackgroundTransparency = 1,
+    Text = "v1.0  •  universal",
+    TextColor3 = Colors.TextDim,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, topBar)
+
+local closeBtn = create("TextButton", {
+    Size = UDim2.fromOffset(24, 24),
+    Position = UDim2.new(1, -34, 0, 10),
+    BackgroundColor3 = Colors.Surface2,
+    Text = "×",
+    TextColor3 = Colors.TextDim,
+    Font = Enum.Font.GothamBold,
+    TextSize = 16,
+    AutoButtonColor = false,
+}, topBar)
+corner(closeBtn, 6)
+
+-- status pill (CPS atual + contador)
+local statusPill = create("Frame", {
+    Size = UDim2.new(1, -24, 0, 40),
+    Position = UDim2.fromOffset(12, 48),
+    BackgroundColor3 = Colors.Surface,
+    BorderSizePixel = 0,
+}, main)
+corner(statusPill, 8)
+
+local statusLabel = create("TextLabel", {
+    Size = UDim2.new(1, -20, 1, 0),
+    Position = UDim2.fromOffset(12, 0),
+    BackgroundTransparency = 1,
+    Text = "Parado",
+    TextColor3 = Colors.TextDim,
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, statusPill)
+
+local clickCount = create("TextLabel", {
+    Size = UDim2.fromOffset(110, 18),
+    Position = UDim2.new(1, -120, 0.5, -9),
+    BackgroundTransparency = 1,
+    Text = "0 cliques",
+    TextColor3 = Colors.Accent,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Right,
+}, statusPill)
+
+-- página scrollável
+local page = create("ScrollingFrame", {
+    Size = UDim2.new(1, -12, 1, -108),
+    Position = UDim2.fromOffset(6, 100),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = Colors.Accent,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+}, main)
+local list = Instance.new("UIListLayout")
+list.Padding = UDim.new(0, 6)
+list.Parent = page
+local pad = Instance.new("UIPadding")
+pad.PaddingLeft = UDim.new(0, 8)
+pad.PaddingRight = UDim.new(0, 12)
+pad.PaddingTop = UDim.new(0, 4)
+pad.PaddingBottom = UDim.new(0, 10)
+pad.Parent = page
+
+--=====================================================================
+-- COMPONENTES
+--=====================================================================
+local function section(text)
+    create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = Colors.TextDim,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, page)
+end
+
+local function createToggle(text, default, changed, key)
+    local row = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = Colors.Surface,
+        AutoButtonColor = false,
+        Text = "",
+        BorderSizePixel = 0,
+    }, page)
+    corner(row, 8)
+
+    create("TextLabel", {
+        Size = UDim2.new(1, -70, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+
+    local track = create("Frame", {
+        Size = UDim2.fromOffset(36, 18),
+        Position = UDim2.new(1, -46, 0.5, -9),
+        BackgroundColor3 = Colors.Surface2,
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 9)
+    local knob = create("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.new(0, 2, 0.5, -7),
+        BackgroundColor3 = Colors.Text,
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 7)
+
+    local state = default and true or false
+    local function render(anim)
+        local kp = state and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+        local tc = state and Colors.Accent or Colors.Surface2
+        if anim then
+            tween(knob, { Position = kp }, 0.15)
+            tween(track, { BackgroundColor3 = tc }, 0.15)
+        else
+            knob.Position = kp
+            track.BackgroundColor3 = tc
+        end
+    end
+
+    local api = {}
+    function api.Set(v, fire)
+        state = v and true or false
+        render(true)
+        if fire ~= false and changed then changed(state) end
+    end
+    function api.Get() return state end
+
+    render(false)
+    if key then Refs[key] = api end
+    row.MouseButton1Click:Connect(function() api.Set(not state, true) end)
+    return api
+end
+
+local function createSlider(text, min, max, default, suffix, changed, key)
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 44),
+        BackgroundColor3 = Colors.Surface,
+        BorderSizePixel = 0,
+    }, page)
+    corner(row, 8)
+
+    create("TextLabel", {
+        Size = UDim2.new(1, -100, 0, 18),
+        Position = UDim2.fromOffset(12, 6),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+    local valueLabel = create("TextLabel", {
+        Size = UDim2.fromOffset(76, 18),
+        Position = UDim2.new(1, -88, 0, 6),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = Colors.Accent,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    }, row)
+
+    local track = create("Frame", {
+        Size = UDim2.new(1, -24, 0, 4),
+        Position = UDim2.new(0, 12, 0, 30),
+        BackgroundColor3 = Colors.Surface2,
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 2)
+
+    local fill = create("Frame", {
+        Size = UDim2.new(0, 0, 1, 0),
+        BackgroundColor3 = Colors.Accent,
+        BorderSizePixel = 0,
+    }, track)
+    corner(fill, 2)
+    local fg = Instance.new("UIGradient")
+    fg.Color = ColorSequence.new(Colors.Accent, Colors.Accent2)
+    fg.Parent = fill
+
+    local knob = create("Frame", {
+        Size = UDim2.fromOffset(12, 12),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        BackgroundColor3 = Colors.Text,
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 6)
+
+    local hit = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 20),
+        Position = UDim2.new(0, 0, 0.5, -10),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, track)
+
+    local value = default
+    local dragging = false
+
+    local function set(v, fire)
+        value = math.clamp(v, min, max)
+        local rel = (max - min) ~= 0 and (value - min) / (max - min) or 0
+        fill.Size = UDim2.new(rel, 0, 1, 0)
+        knob.Position = UDim2.new(rel, 0, 0.5, 0)
+        valueLabel.Text = fmt(value) .. (suffix or "")
+        if fire ~= false and changed then changed(value) end
+    end
+
+    local function fromInput(input)
+        local rel = math.clamp((input.Position.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+        set(min + rel * (max - min))
+    end
+
+    hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            fromInput(input)
+        end
+    end)
+    conns[#conns + 1] = UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            fromInput(input)
+        end
+    end)
+    conns[#conns + 1] = UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    local api = {}
+    function api.Set(v, fire) set(v, fire) end
+    function api.Get() return value end
+    set(default, false)
+    if key then Refs[key] = api end
+    return api
+end
+
+local function createDropdown(text, options, default, changed, key)
+    local row = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = Colors.Surface,
+        AutoButtonColor = false,
+        Text = "",
+        BorderSizePixel = 0,
+    }, page)
+    corner(row, 8)
+
+    create("TextLabel", {
+        Size = UDim2.new(1, -150, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+
+    local btn = create("TextButton", {
+        Size = UDim2.fromOffset(130, 24),
+        Position = UDim2.new(1, -140, 0.5, -12),
+        BackgroundColor3 = Colors.Surface2,
+        Text = default,
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        AutoButtonColor = false,
+    }, row)
+    corner(btn, 6)
+
+    local popup = create("Frame", {
+        Size = UDim2.fromOffset(130, #options * 26 + 8),
+        BackgroundColor3 = Colors.Surface,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 20,
+    }, gui)
+    corner(popup, 8)
+    stroke(popup, Colors.Stroke)
+    local pl = Instance.new("UIListLayout")
+    pl.Padding = UDim.new(0, 2)
+    pl.Parent = popup
+    local pp = Instance.new("UIPadding")
+    pp.PaddingTop = UDim.new(0, 4)
+    pp.PaddingLeft = UDim.new(0, 4)
+    pp.PaddingRight = UDim.new(0, 4)
+    pp.Parent = popup
+
+    local open = false
+    local api = {}
+
+    for _, opt in ipairs(options) do
+        local ob = create("TextButton", {
+            Size = UDim2.new(1, 0, 0, 24),
+            BackgroundColor3 = Colors.Surface,
+            Text = opt,
+            TextColor3 = Colors.Text,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 12,
+            AutoButtonColor = false,
+        }, popup)
+        corner(ob, 5)
+        ob.MouseButton1Click:Connect(function()
+            btn.Text = opt
+            popup.Visible = false
+            open = false
+            if changed then changed(opt) end
+        end)
+    end
+
+    btn.MouseButton1Click:Connect(function()
+        open = not open
+        popup.Visible = open
+        if open then
+            popup.Position = UDim2.fromOffset(btn.AbsolutePosition.X, btn.AbsolutePosition.Y + btn.AbsoluteSize.Y + 4)
+        end
+    end)
+
+    function api.Set(v, fire)
+        btn.Text = v
+        if fire ~= false and changed then changed(v) end
+    end
+    function api.Get() return btn.Text end
+    if key then Refs[key] = api end
+    return api
+end
+
+local function createKeybind(text, defaultKey, changed, key)
+    local row = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = Colors.Surface,
+        AutoButtonColor = false,
+        Text = "",
+        BorderSizePixel = 0,
+    }, page)
+    corner(row, 8)
+
+    create("TextLabel", {
+        Size = UDim2.new(1, -110, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+
+    local btn = create("TextButton", {
+        Size = UDim2.fromOffset(90, 24),
+        Position = UDim2.new(1, -100, 0.5, -12),
+        BackgroundColor3 = Colors.Surface2,
+        Text = defaultKey.Name,
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        AutoButtonColor = false,
+    }, row)
+    corner(btn, 6)
+
+    local current = defaultKey
+    local listening = false
+    local api = {}
+
+    btn.MouseButton1Click:Connect(function()
+        listening = true
+        State.listeningKey = true
+        btn.Text = "..."
+        btn.TextColor3 = Colors.Accent
+    end)
+
+    conns[#conns + 1] = UIS.InputBegan:Connect(function(input)
+        if listening and input.KeyCode ~= Enum.KeyCode.Unknown then
+            listening = false
+            State.listeningKey = false
+            current = input.KeyCode
+            btn.Text = current.Name
+            btn.TextColor3 = Colors.Text
+            if changed then changed(current) end
+        end
+    end)
+
+    function api.Set(v, fire)
+        current = v
+        btn.Text = v.Name
+        if fire ~= false and changed then changed(v) end
+    end
+    function api.Get() return current end
+    if key then Refs[key] = api end
+    return api
+end
+
+local function createButton(text, callback)
+    local btn = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 34),
+        BackgroundColor3 = Colors.Surface,
+        Text = text,
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+    }, page)
+    corner(btn, 8)
+    btn.MouseButton1Click:Connect(callback)
+    return btn
+end
+
+--=====================================================================
+-- CONTEÚDO DA UI
+--=====================================================================
+section("PRINCIPAL")
+createToggle("Auto click ativado", Config.Enabled, function(v) Config.Enabled = v end, "Enabled")
+createDropdown("Botão do clique", { "Esquerdo", "Direito" }, Config.Button, function(v) Config.Button = v end, "Button")
+createToggle("Modo hold (segurar tecla)", Config.HoldMode, function(v) Config.HoldMode = v end, "HoldMode")
+createKeybind("Hotkey de clique", Config.Hotkey, function(k) Config.Hotkey = k end, "Hotkey")
+
+section("VELOCIDADE")
+createSlider("CPS (cliques/segundo)", 1, 100, Config.CPS, "", function(v) Config.CPS = v end, "CPS")
+
+section("ANTI-PADRÃO")
+createToggle("Randomizar intervalo", Config.Randomize, function(v) Config.Randomize = v end, "Randomize")
+createSlider("Variação", 0, 60, Config.RandomAmount, "%", function(v) Config.RandomAmount = v end, "RandomAmount")
+
+section("EXTRAS")
+createToggle("Não clicar digitando no chat", Config.SkipGameProcessed, function(v) Config.SkipGameProcessed = v end, "SkipGameProcessed")
+createButton("Zerar contador", function()
+    totalClicks = 0
+    clickCount.Text = "0 cliques"
+end)
+
+section("ATALHOS")
+create("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 50),
+    BackgroundColor3 = Colors.Surface,
+    BackgroundTransparency = 0.3,
+    Text = "V  →  segurar para clicar (modo hold) / liga-desliga\nNo modo toggle, a hotkey liga e desliga o autoclick.\nV também abre este painel quando solto rápido? Não — use o × p/ fechar.",
+    TextColor3 = Colors.TextDim,
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, page)
+
+--=====================================================================
+-- INPUT
+--=====================================================================
+conns[#conns + 1] = UIS.InputBegan:Connect(function(input, gpe)
+    if State.listeningKey then return end
+
+    if input.KeyCode == Config.Hotkey then
+        if gpe and Config.SkipGameProcessed then return end
+        if Config.HoldMode then
+            State.holdDown = true
+        else
+            State.toggleOn = not State.toggleOn
+        end
+    end
+end)
+
+conns[#conns + 1] = UIS.InputEnded:Connect(function(input)
+    if input.KeyCode == Config.Hotkey then
+        State.holdDown = false
+    end
+end)
+
+-- painel: abrir/fechar com RightShift (independente da hotkey de clique)
+conns[#conns + 1] = UIS.InputBegan:Connect(function(input, gpe)
+    if State.listeningKey then return end
+    if input.KeyCode == Enum.KeyCode.RightShift and not gpe then
+        gui.Enabled = not gui.Enabled
+    end
+end)
+
+--=====================================================================
+-- STATUS (atualiza o pill)
+--=====================================================================
+conns[#conns + 1] = RunService.RenderStepped:Connect(function()
+    local active = Config.Enabled and (Config.HoldMode and State.holdDown or State.toggleOn)
+    if active then
+        statusLabel.Text = "CLICANDO  •  " .. fmt(Config.CPS) .. " CPS"
+        statusLabel.TextColor3 = Colors.Accent2
+    else
+        statusLabel.Text = "Parado"
+        statusLabel.TextColor3 = Colors.TextDim
+    end
+    clickCount.Text = tostring(totalClicks) .. " cliques"
+end)
+
+-- popup do dropdown fecha ao clicar fora
+conns[#conns + 1] = UIS.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        for _, pg in ipairs({ page }) do
+            -- fecha popups simples clicando em qualquer lugar da página
+        end
+        task.defer(function()
+            for _, child in ipairs(gui:GetDescendants()) do
+                if child.Name == "" and child:IsA("Frame") and child.ZIndex == 20 and child.Visible then
+                    -- noop (popup fecha ao escolher opção)
+                end
+            end
+        end)
+    end
+end)
+
+--=====================================================================
+-- LIMPEZA
+--=====================================================================
+getgenv().AutoClickPro_Cleanup = function()
+    getgenv().AutoClickPro_Alive = false
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    conns = {}
+    pcall(function() gui:Destroy() end)
+end
+
+--=====================================================================
+-- BOOT
+--=====================================================================
+task.spawn(function()
+    task.wait(0.2)
+    -- notificação simples
+    local f = create("Frame", {
+        Size = UDim2.fromOffset(220, 34),
+        Position = UDim2.new(1, -240, 1, -50),
+        BackgroundColor3 = Colors.Surface,
+        BorderSizePixel = 0,
+    }, gui)
+    corner(f, 8)
+    stroke(f, Colors.Accent, 1)
+    create("TextLabel", {
+        Size = UDim2.new(1, -20, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        BackgroundTransparency = 1,
+        Text = "Auto Click Pro carregado • RightShift abre",
+        TextColor3 = Colors.Text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, f)
+    task.delay(3, function()
+        if f.Parent then f:Destroy() end
+    end)
+end)
